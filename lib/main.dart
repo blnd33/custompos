@@ -1000,6 +1000,411 @@ class PosStore {
   Future<List<Map<String, Object?>>> expenseTypes() =>
       db.query('expense_types', orderBy: 'name');
 
+  // ── Reports ──────────────────────────────────────────────────────────────
+
+  Future<Map<String, Object?>> reportSummary(String from, String to) async {
+    final sales = (await db.rawQuery('''
+      SELECT COUNT(*) invoices,
+             COALESCE(SUM(total),0) total_sales,
+             COALESCE(SUM(discount_amount),0) total_discounts,
+             COALESCE(SUM(total_cost),0) total_cost
+      FROM sales
+      WHERE refunded = 0 AND date(created_at) BETWEEN ? AND ?
+    ''', [from, to])).first;
+    final expenses = (await db.rawQuery('''
+      SELECT COALESCE(SUM(amount),0) total_expenses
+      FROM expenses
+      WHERE date(created_at) BETWEEN ? AND ?
+    ''', [from, to])).first;
+    final catSales = (await db.rawQuery('''
+      SELECT COALESCE(SUM(sale_items.total),0) cat_total,
+             COALESCE(SUM(sales.discount_amount),0) cat_discounts
+      FROM sale_items
+      JOIN sales ON sales.id = sale_items.sale_id
+      WHERE sales.refunded = 0
+        AND sale_items.product_id < 0
+        AND date(sales.created_at) BETWEEN ? AND ?
+    ''', [from, to])).first;
+    final productSales = (await db.rawQuery('''
+      SELECT COALESCE(SUM(sale_items.total),0) prod_total
+      FROM sale_items
+      JOIN sales ON sales.id = sale_items.sale_id
+      WHERE sales.refunded = 0
+        AND sale_items.product_id > 0
+        AND date(sales.created_at) BETWEEN ? AND ?
+    ''', [from, to])).first;
+    final invoices = (sales['invoices'] as num?)?.toInt() ?? 0;
+    final totalSales = (sales['total_sales'] as num?)?.toDouble() ?? 0;
+    final totalExpenses = (expenses['total_expenses'] as num?)?.toDouble() ?? 0;
+    final catTotal = (catSales['cat_total'] as num?)?.toDouble() ?? 0;
+    final prodTotal = (productSales['prod_total'] as num?)?.toDouble() ?? 0;
+    return {
+      'invoices': invoices,
+      'total_sales': totalSales,
+      'avg_ticket': invoices > 0 ? totalSales / invoices : 0.0,
+      'total_discounts': (sales['total_discounts'] as num?)?.toDouble() ?? 0,
+      'total_expenses': totalExpenses,
+      'cat_sales': catTotal,
+      'product_sales': prodTotal,
+      'net_profit': totalSales - totalExpenses,
+    };
+  }
+
+  Future<List<Map<String, Object?>>> reportPeriods(
+    String from,
+    String to,
+    String groupBy,
+  ) async {
+    final fmt = groupBy == 'monthly'
+        ? "strftime('%Y-%m', created_at)"
+        : groupBy == 'yearly'
+        ? "strftime('%Y', created_at)"
+        : "date(created_at)";
+    return db.rawQuery('''
+      SELECT $fmt AS period,
+             COUNT(*) invoices,
+             COALESCE(SUM(total),0) total_sales,
+             COALESCE(SUM(total)/NULLIF(COUNT(*),0),0) avg_ticket
+      FROM sales
+      WHERE refunded = 0 AND date(created_at) BETWEEN ? AND ?
+      GROUP BY period ORDER BY period
+    ''', [from, to]);
+  }
+
+  Future<List<Map<String, Object?>>> reportTopProducts(
+    String from,
+    String to,
+  ) async {
+    return db.rawQuery('''
+      SELECT products.name,
+             COALESCE(SUM(sale_items.qty),0) qty_sold,
+             products.purchase_price unit_cost,
+             COALESCE(SUM(sale_items.total)/NULLIF(SUM(sale_items.qty),0),0) avg_sell_price,
+             COALESCE(SUM(sale_items.discount_amount),0) discount,
+             COALESCE(SUM(sale_items.total),0) final_total
+      FROM sale_items
+      JOIN sales ON sales.id = sale_items.sale_id
+      JOIN products ON products.id = sale_items.product_id
+      WHERE sales.refunded = 0
+        AND sale_items.product_id > 0
+        AND date(sales.created_at) BETWEEN ? AND ?
+      GROUP BY products.id
+      ORDER BY final_total DESC
+    ''', [from, to]);
+  }
+
+  Future<List<Map<String, Object?>>> reportCategorySales(
+    String from,
+    String to,
+    String groupBy,
+  ) async {
+    return db.rawQuery('''
+      SELECT categories.name,
+             COUNT(DISTINCT sales.id) invoices,
+             COALESCE(SUM(sale_items.total + sales.discount_amount * (sale_items.total / NULLIF(sales.subtotal,0))),0) before_discount,
+             COALESCE(SUM(sales.discount_amount * (sale_items.total / NULLIF(sales.subtotal,0))),0) discount,
+             COALESCE(SUM(sale_items.total),0) after_discount
+      FROM sale_items
+      JOIN sales ON sales.id = sale_items.sale_id
+      JOIN categories ON categories.id = -sale_items.product_id
+      WHERE sales.refunded = 0
+        AND sale_items.product_id < 0
+        AND date(sales.created_at) BETWEEN ? AND ?
+      GROUP BY categories.id
+      ORDER BY after_discount DESC
+    ''', [from, to]);
+  }
+
+  Future<List<Map<String, Object?>>> reportExpenses(String from, String to) {
+    return db.rawQuery('''
+      SELECT expenses.*, expense_types.name AS type, users.name AS user
+      FROM expenses
+      JOIN expense_types ON expense_types.id = expenses.expense_type_id
+      JOIN users ON users.id = expenses.user_id
+      WHERE date(expenses.created_at) BETWEEN ? AND ?
+      ORDER BY expenses.created_at DESC
+    ''', [from, to]);
+  }
+
+  Future<List<Map<String, Object?>>> reportExpensesByType(
+    String from,
+    String to,
+  ) {
+    return db.rawQuery('''
+      SELECT expense_types.name,
+             COALESCE(SUM(expenses.amount),0) total
+      FROM expenses
+      JOIN expense_types ON expense_types.id = expenses.expense_type_id
+      WHERE date(expenses.created_at) BETWEEN ? AND ?
+      GROUP BY expense_types.id
+      ORDER BY total DESC
+    ''', [from, to]);
+  }
+
+  Future<String> printReport({
+    required String from,
+    required String to,
+    required Map<String, Object?> summary,
+    required List<Map<String, Object?>> periods,
+    required List<Map<String, Object?>> products,
+    required List<Map<String, Object?>> catSales,
+    required List<Map<String, Object?>> expenses,
+    required List<Map<String, Object?>> expensesByType,
+    bool printSummary = true,
+    bool printPeriods = true,
+    bool printProducts = true,
+    bool printCatSales = true,
+    bool printExpenses = true,
+    bool printProfitLoss = true,
+  }) async {
+    final appSettings = await settings();
+    final storeName = appSettings['store_name']?.trim().isNotEmpty == true
+        ? appSettings['store_name']!.trim()
+        : (isArabic ? 'به نگين كريستال' : 'Bangeen Crystal');
+
+    final invoices = (summary['invoices'] as num?)?.toInt() ?? 0;
+    final totalSales = (summary['total_sales'] as num?)?.toDouble() ?? 0;
+    final avgTicket = (summary['avg_ticket'] as num?)?.toDouble() ?? 0;
+    final totalExpenses = (summary['total_expenses'] as num?)?.toDouble() ?? 0;
+    final productSales = (summary['product_sales'] as num?)?.toDouble() ?? 0;
+    final netProfit = totalSales - totalExpenses;
+
+    double catGross = 0, catDiscount = 0, catNet = 0;
+    for (final r in catSales) {
+      catGross += (r['before_discount'] as num?)?.toDouble() ?? 0;
+      catDiscount += (r['discount'] as num?)?.toDouble() ?? 0;
+      catNet += (r['after_discount'] as num?)?.toDouble() ?? 0;
+    }
+    double expenseTotal = 0;
+    for (final r in expenses) {
+      expenseTotal += (r['amount'] as num?)?.toDouble() ?? 0;
+    }
+
+    // Thermal receipt helpers
+    String row2(String a, String b, {bool bold = false}) {
+      final w = bold ? 'font-weight:900;' : '';
+      return '<div class="row2" style="${w}"><span>$a</span><span>$b</span></div>';
+    }
+    String section(String title) =>
+        '<div class="dbl"></div><div class="sec-title">$title</div>';
+    String divider() => '<div class="sng"></div>';
+    String dashed() => '<div class="dsh"></div>';
+
+    // Load logo
+    final exeDir = p.dirname(Platform.resolvedExecutable);
+    final logoFile = File(p.join(exeDir, 'data', 'flutter_assets', brandLogo));
+    final logoSrc = logoFile.existsSync()
+        ? 'data:image/png;base64,${base64Encode(await logoFile.readAsBytes())}'
+        : '';
+
+    final appPhone = appSettings['store_phone']?.trim() ?? '';
+    final appAddress = appSettings['store_address']?.trim() ?? '';
+    final printDate = DateFormat('yyyy-MM-dd HH:mm').format(DateTime.now());
+
+    final buf = StringBuffer();
+
+    // ── header ────────────────────────────────────────────────────────────
+    buf.write('<div class="header">');
+    if (logoSrc.isNotEmpty) buf.write('<img class="logo" src="$logoSrc">');
+    buf.write('<div class="store-name">$storeName</div>');
+    if (appAddress.isNotEmpty) buf.write('<div class="store-sub">$appAddress</div>');
+    if (appPhone.isNotEmpty) buf.write('<div class="store-sub">$appPhone</div>');
+    buf.write('</div>');
+    buf.write('<div class="dbl"></div>');
+    buf.write(row2(isArabic ? 'التقرير' : 'Report', isArabic ? 'تقرير المبيعات' : 'Sales Report'));
+    buf.write(row2(isArabic ? 'الفترة' : 'Period', '$from → $to'));
+    buf.write(row2(isArabic ? 'طُبع' : 'Printed', printDate));
+    buf.write('<div class="dbl"></div>');
+
+    // ── Summary ────────────────────────────────────────────────────────────
+    if (printSummary) {
+      buf.write(section(isArabic ? 'الملخص' : 'SUMMARY'));
+      buf.write(row2(isArabic ? 'إجمالي المبيعات' : 'Total Sales', money(totalSales), bold: true));
+      buf.write(row2(isArabic ? 'الفواتير' : 'Invoices', '$invoices'));
+      buf.write(row2(isArabic ? 'متوسط الفاتورة' : 'Avg Ticket', money(avgTicket)));
+    }
+
+    // ── Report Data (periods) ──────────────────────────────────────────────
+    if (printPeriods && periods.isNotEmpty) {
+      buf.write(section(isArabic ? 'بيانات التقرير' : 'REPORT DATA'));
+      buf.write('<table><thead><tr>'
+          '<th>${isArabic ? 'الفترة' : 'Period'}</th>'
+          '<th class="num">${isArabic ? 'فواتير' : 'Inv'}</th>'
+          '<th class="amt">${isArabic ? 'المبيعات' : 'Sales'}</th>'
+          '</tr></thead><tbody>');
+      for (final r in periods) {
+        buf.write('<tr>'
+            '<td>${r['period']}</td>'
+            '<td class="num">${r['invoices']}</td>'
+            '<td class="amt">${money(r['total_sales'])}</td>'
+            '</tr>');
+      }
+      buf.write('</tbody></table>');
+    }
+
+    // ── Detailed Products ──────────────────────────────────────────────────
+    if (printProducts && products.isNotEmpty) {
+      buf.write(section(isArabic ? 'المنتجات التفصيلية' : 'PRODUCT SALES'));
+      buf.write('<table><thead><tr>'
+          '<th>${isArabic ? 'المنتج' : 'Product'}</th>'
+          '<th class="num">${isArabic ? 'كمية' : 'Qty'}</th>'
+          '<th class="amt">${isArabic ? 'الإجمالي' : 'Total'}</th>'
+          '</tr></thead><tbody>');
+      for (final r in products) {
+        buf.write('<tr>'
+            '<td>${r['name']}</td>'
+            '<td class="num">${r['qty_sold']}</td>'
+            '<td class="amt">${money(r['final_total'])}</td>'
+            '</tr>');
+      }
+      buf.write('</tbody></table>');
+    }
+
+    // ── Category Sales ─────────────────────────────────────────────────────
+    if (printCatSales && catSales.isNotEmpty) {
+      buf.write(section(isArabic ? 'مبيعات الفئات' : 'CATEGORY SALES'));
+      buf.write(row2(isArabic ? 'الإجمالي قبل الخصم' : 'Gross Total', money(catGross)));
+      if (catDiscount > 0) buf.write(row2(isArabic ? 'الخصومات' : 'Discounts', '- ${money(catDiscount)}'));
+      buf.write(row2(isArabic ? 'الصافي' : 'Net Total', money(catNet), bold: true));
+      buf.write(dashed());
+      buf.write('<table><thead><tr>'
+          '<th>${isArabic ? 'الفئة' : 'Category'}</th>'
+          '<th class="num">${isArabic ? 'فواتير' : 'Inv'}</th>'
+          '<th class="amt">${isArabic ? 'الصافي' : 'Net'}</th>'
+          '</tr></thead><tbody>');
+      for (final r in catSales) {
+        buf.write('<tr>'
+            '<td>${r['name']}</td>'
+            '<td class="num">${r['invoices']}</td>'
+            '<td class="amt">${money(r['after_discount'])}</td>'
+            '</tr>');
+      }
+      buf.write('</tbody></table>');
+    }
+
+    // ── Expenses ───────────────────────────────────────────────────────────
+    if (printExpenses) {
+      buf.write(section(isArabic ? 'المصاريف' : 'EXPENSES'));
+      if (expensesByType.isNotEmpty) {
+        for (final r in expensesByType) {
+          buf.write(row2('${r['name']}', money(r['total'])));
+        }
+        buf.write(dashed());
+      }
+      buf.write(row2(
+        isArabic ? 'إجمالي المصاريف' : 'Total Expenses',
+        '- ${money(expenseTotal)}',
+        bold: true,
+      ));
+      if (expenses.isNotEmpty) {
+        buf.write(dashed());
+        buf.write('<table><thead><tr>'
+            '<th>${isArabic ? 'التاريخ' : 'Date'}</th>'
+            '<th>${isArabic ? 'النوع' : 'Type'}</th>'
+            '<th class="amt">${isArabic ? 'المبلغ' : 'Amt'}</th>'
+            '</tr></thead><tbody>');
+        for (final r in expenses) {
+          final date = DateFormat('dd/MM').format(DateTime.parse('${r['created_at']}'));
+          buf.write('<tr>'
+              '<td>$date</td>'
+              '<td>${r['type']}</td>'
+              '<td class="amt">- ${money(r['amount'])}</td>'
+              '</tr>');
+        }
+        buf.write('</tbody></table>');
+      }
+    }
+
+    // ── Profit & Loss ──────────────────────────────────────────────────────
+    if (printProfitLoss) {
+      buf.write(section(isArabic ? 'الأرباح والخسائر' : 'PROFIT & LOSS'));
+      buf.write(row2(isArabic ? 'مبيعات الفئات' : 'Cat POS Sales', money(catNet)));
+      buf.write(row2(isArabic ? 'مبيعات المنتجات' : 'Product Sales', money(productSales)));
+      buf.write(divider());
+      buf.write(row2(isArabic ? 'إجمالي المبيعات' : 'Total Sales', money(totalSales), bold: true));
+      buf.write(row2(isArabic ? 'إجمالي المصاريف' : 'Total Expenses', '- ${money(expenseTotal)}'));
+      buf.write('<div class="total-box">');
+      buf.write('<span>${isArabic ? 'صافي الربح' : 'NET PROFIT'}</span>');
+      buf.write('<span>${money(netProfit)}</span>');
+      buf.write('</div>');
+    }
+
+    buf.write('<div class="footer">');
+    buf.write('<div class="dsh"></div>');
+    buf.write('<div>${isArabic ? 'شكراً لكم' : 'Thank you'}</div>');
+    buf.write('</div>');
+
+    final receiptContent = buf.toString();
+    final dir = Directory(p.join((await getApplicationSupportDirectory()).path, 'receipts'));
+    await dir.create(recursive: true);
+    final ts = DateFormat('yyyyMMdd_HHmmss').format(DateTime.now());
+    final htmlPath = p.join(dir.path, 'report_$ts.html');
+
+    final html = '''<!doctype html>
+<html lang="${isArabic ? 'ar' : 'en'}" dir="${isArabic ? 'rtl' : 'ltr'}">
+<head>
+  <meta charset="utf-8">
+  <title>${isArabic ? 'تقرير' : 'Report'} — $storeName</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body {
+      background: #fff;
+      font-family: Arial, Tahoma, 'Segoe UI', sans-serif;
+      color: #000;
+      font-size: 9.5px;
+      font-weight: 600;
+      width: 72mm;
+      margin: 0; padding: 0;
+    }
+    .receipt { width: 72mm; max-width: 72mm; margin: 0; padding: 2mm; }
+    .header { text-align: center; padding-bottom: 1.5mm; }
+    .logo { width: 26mm; height: 20mm; object-fit: contain; display: block; margin: 0 auto 1.5mm; }
+    .store-name { font-size: 13px; font-weight: 900; line-height: 1.2; }
+    .store-sub { font-size: 8.5px; line-height: 1.4; }
+    .dbl { border-top: 3px double #000; margin: 1.5mm 0; }
+    .sng { border-top: 1px solid #000; margin: 1mm 0; }
+    .dsh { border-top: 1px dashed #000; margin: 1mm 0; }
+    .row2 { display: flex; justify-content: space-between; font-size: 9px; line-height: 1.8; }
+    .row2 span:last-child { font-weight: 700; }
+    .sec-title { font-size: 9px; font-weight: 900; text-align: center; padding: 1mm 0; letter-spacing: 0.5px; }
+    table { width: 100%; border-collapse: collapse; font-size: 8.5px; table-layout: fixed; }
+    thead tr { border-bottom: 1px solid #000; }
+    th { padding: 0.7mm 0.5mm; font-size: 8px; font-weight: 800; }
+    td { padding: 0.6mm 0.5mm; vertical-align: top; overflow-wrap: anywhere; word-break: break-word; }
+    .num { text-align: center; }
+    .amt { text-align: end; white-space: nowrap; }
+    .total-box {
+      border: 2.5px solid #000;
+      display: flex; justify-content: space-between; align-items: center;
+      padding: 1.5mm 2mm; margin: 1.5mm 0;
+      font-size: 13px; font-weight: 900;
+    }
+    .footer { text-align: center; font-size: 8.5px; line-height: 1.6; padding-bottom: 4mm; }
+    @media print {
+      @page { size: 80mm auto; margin: 0; }
+      html, body { width: 72mm; margin: 0; padding: 0; }
+      .receipt { width: 72mm; max-width: 72mm; padding: 2mm; }
+      .no-print { display: none !important; }
+    }
+  </style>
+  <script>
+    window.addEventListener('load', () => setTimeout(() => window.print(), 500));
+  </script>
+</head>
+<body>
+<div class="receipt">
+$receiptContent
+</div>
+</body>
+</html>''';
+
+    await File(htmlPath).writeAsString(html, flush: true);
+    if (Platform.isWindows) {
+      await Process.start('cmd', ['/c', 'start', '', htmlPath], mode: ProcessStartMode.detached);
+    }
+    return htmlPath;
+  }
+
   Future<void> addExpense(
     int typeId,
     double amount,
@@ -1922,6 +2327,7 @@ class _ShellState extends State<Shell> {
     tx('الفئات', 'Categories'),
     tx('المخزون', 'Inventory'),
     tx('المالية', 'Finance'),
+    tx('التقارير', 'Reports'),
     tx('الإعدادات', 'Settings'),
     tx('النسخ الاحتياطي', 'Backup'),
   ];
@@ -1933,6 +2339,7 @@ class _ShellState extends State<Shell> {
     Icons.category,
     Icons.warehouse,
     Icons.payments,
+    Icons.bar_chart,
     Icons.settings,
     Icons.backup,
   ];
@@ -1953,24 +2360,31 @@ class _ShellState extends State<Shell> {
       CategoriesPage(store: widget.store),
       InventoryPage(store: widget.store, user: widget.user),
       FinancePage(store: widget.store, user: widget.user),
+      ReportsPage(store: widget.store, user: widget.user),
       SettingsPage(store: widget.store),
       BackupPage(store: widget.store),
     ];
     return Scaffold(
       body: Row(
         children: [
-          NavigationRail(
+          SizedBox(
+            width: 90,
+            child: SingleChildScrollView(
+              child: IntrinsicHeight(
+                child: NavigationRail(
             backgroundColor: brandDark,
             selectedIconTheme: const IconThemeData(color: brandGold),
             unselectedIconTheme: const IconThemeData(color: Color(0xffd8d0c2)),
             selectedLabelTextStyle: const TextStyle(
               color: brandGold,
               fontWeight: FontWeight.w800,
+              fontSize: 10,
             ),
-            unselectedLabelTextStyle: const TextStyle(color: Color(0xffd8d0c2)),
+            unselectedLabelTextStyle: const TextStyle(color: Color(0xffd8d0c2), fontSize: 10),
             selectedIndex: index,
             onDestinationSelected: (value) => setState(() => index = value),
             labelType: NavigationRailLabelType.all,
+            minWidth: 90,
             leading: Padding(
               padding: const EdgeInsets.only(top: 12, bottom: 18),
               child: Column(
@@ -2032,6 +2446,9 @@ class _ShellState extends State<Shell> {
                   label: Text(labels[i]),
                 ),
             ],
+                ),
+              ),
+            ),
           ),
           const VerticalDivider(width: 1),
           Expanded(
@@ -2864,6 +3281,157 @@ class _CatPosPageState extends State<CatPosPage> {
       color: const Color(0xffeeeae4),
       child: Row(
         children: [
+          // Keypad panel — bottom-left corner
+          SizedBox(
+            width: 340,
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(16, 16, 8, 16),
+              child: Column(
+                mainAxisAlignment: MainAxisAlignment.end,
+                children: [
+                  Card(
+                    child: Padding(
+                      padding: const EdgeInsets.all(14),
+                      child: Column(
+                        mainAxisSize: MainAxisSize.min,
+                        children: [
+                      Container(
+                        height: 60,
+                        alignment: Alignment.centerRight,
+                        padding: const EdgeInsets.symmetric(horizontal: 14),
+                        decoration: BoxDecoration(
+                          color: const Color(0xfff2eee8),
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                        child: Text(
+                          money(amount),
+                          style: const TextStyle(
+                            fontSize: 24,
+                            fontWeight: FontWeight.w900,
+                          ),
+                        ),
+                      ),
+                      const SizedBox(height: 10),
+                      for (final row in const [
+                        ['7', '8', '9'],
+                        ['4', '5', '6'],
+                        ['1', '2', '3'],
+                      ])
+                        Padding(
+                          padding: const EdgeInsets.only(bottom: 6),
+                          child: Row(
+                            children: [
+                              for (final digit in row)
+                                Expanded(
+                                  child: Padding(
+                                    padding: const EdgeInsets.symmetric(horizontal: 3),
+                                    child: OutlinedButton(
+                                      onPressed: () => pressDigit(digit),
+                                      style: OutlinedButton.styleFrom(
+                                        padding: EdgeInsets.zero,
+                                        minimumSize: const Size(0, 52),
+                                      ),
+                                      child: Text(
+                                        digit,
+                                        style: const TextStyle(
+                                          fontSize: 20,
+                                          fontWeight: FontWeight.w900,
+                                        ),
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                            ],
+                          ),
+                        ),
+                      Row(
+                        children: [
+                          Expanded(
+                            flex: 2,
+                            child: Padding(
+                              padding: const EdgeInsets.symmetric(horizontal: 3),
+                              child: OutlinedButton(
+                                onPressed: () => pressDigit('0'),
+                                style: OutlinedButton.styleFrom(
+                                  padding: EdgeInsets.zero,
+                                  minimumSize: const Size(0, 52),
+                                ),
+                                child: const Text(
+                                  '0',
+                                  style: TextStyle(
+                                    fontSize: 20,
+                                    fontWeight: FontWeight.w900,
+                                  ),
+                                ),
+                              ),
+                            ),
+                          ),
+                          Expanded(
+                            child: Padding(
+                              padding: const EdgeInsets.symmetric(horizontal: 3),
+                              child: OutlinedButton.icon(
+                                onPressed: backspace,
+                                icon: const Icon(Icons.backspace_outlined, size: 18),
+                                label: const Text(''),
+                                style: OutlinedButton.styleFrom(
+                                  padding: EdgeInsets.zero,
+                                  minimumSize: const Size(0, 52),
+                                  foregroundColor: Colors.red,
+                                  backgroundColor: const Color(0xffffeeee),
+                                ),
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 8),
+                      FilledButton(
+                        onPressed: addCategoryAmount,
+                        style: FilledButton.styleFrom(
+                          backgroundColor: accent,
+                          foregroundColor: Colors.white,
+                          minimumSize: const Size.fromHeight(50),
+                        ),
+                        child: Text(
+                          tx('اضغط  X', 'PRESS  X'),
+                          style: const TextStyle(
+                            fontSize: 20,
+                            fontWeight: FontWeight.w900,
+                          ),
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      Text(
+                        tx(
+                          'الرقم × 1,000 د.ع. مثال: اضغط 5 ثم X = 5,000 د.ع.',
+                          'Number x 1,000 IQD. Example: press 5 then X = 5,000 IQD.',
+                        ),
+                        style: TextStyle(
+                          fontSize: 11,
+                          color: Colors.brown.shade500,
+                        ),
+                        textAlign: TextAlign.center,
+                      ),
+                      if (message.isNotEmpty)
+                        Padding(
+                          padding: const EdgeInsets.only(top: 8),
+                          child: Text(
+                            message,
+                            style: const TextStyle(
+                              color: Colors.red,
+                              fontSize: 12,
+                            ),
+                            textAlign: TextAlign.center,
+                          ),
+                        ),
+                        ],
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
           SizedBox(
             width: 430,
             child: Padding(
@@ -2970,9 +3538,10 @@ class _CatPosPageState extends State<CatPosPage> {
               ),
             ),
           ),
+          // Categories grid (expanded)
           Expanded(
             child: Padding(
-              padding: const EdgeInsets.fromLTRB(8, 16, 16, 16),
+              padding: const EdgeInsets.fromLTRB(8, 16, 8, 16),
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.stretch,
                 children: [
@@ -2991,206 +3560,67 @@ class _CatPosPageState extends State<CatPosPage> {
                     ),
                   ),
                   const SizedBox(height: 12),
-                  SizedBox(
-                    height: 126,
-                    child: Scrollbar(
-                      controller: categoryScroll,
-                      thumbVisibility: true,
-                      trackVisibility: true,
-                      interactive: true,
-                      child: Padding(
-                        padding: const EdgeInsets.only(bottom: 16),
-                        child: ListView.separated(
-                          controller: categoryScroll,
-                          scrollDirection: Axis.horizontal,
-                          reverse: true,
-                          itemBuilder: (_, i) {
-                            final category = categories[i];
-                            final selected =
-                                selectedCategory?['id'] == category['id'];
-                            final colors = [
-                              const Color(0xffe67e22),
-                              const Color(0xffc0392b),
-                              const Color(0xff8e44ad),
-                              const Color(0xff27ae60),
-                              accent,
-                              const Color(0xff2874a6),
-                            ];
-                            return SizedBox(
-                              width: 150,
-                              child: Card(
-                                color: selected
-                                    ? const Color(0xfffff7df)
-                                    : Colors.white,
-                                child: InkWell(
-                                  onTap: () => setState(
-                                    () => selectedCategory = category,
-                                  ),
-                                  child: Column(
-                                    mainAxisAlignment: MainAxisAlignment.center,
-                                    children: [
-                                      CircleAvatar(
-                                        backgroundColor:
-                                            colors[i % colors.length],
-                                        radius: 18,
-                                      ),
-                                      const SizedBox(height: 10),
-                                      Text(
-                                        '${category['name']}',
-                                        maxLines: 1,
-                                        overflow: TextOverflow.ellipsis,
-                                        style: const TextStyle(
-                                          fontWeight: FontWeight.w800,
-                                        ),
-                                      ),
-                                      const SizedBox(height: 4),
-                                      Text(
-                                        money(category['inventory_value']),
-                                        maxLines: 1,
-                                        overflow: TextOverflow.ellipsis,
-                                        style: const TextStyle(
-                                          fontSize: 12,
-                                          color: Color(0xff7a6a52),
-                                        ),
-                                      ),
-                                    ],
-                                  ),
-                                ),
-                              ),
-                            );
-                          },
-                          separatorBuilder: (_, __) =>
-                              const SizedBox(width: 10),
-                          itemCount: categories.length,
-                        ),
+                  Expanded(
+                    child: GridView.builder(
+                      gridDelegate:
+                          const SliverGridDelegateWithFixedCrossAxisCount(
+                        crossAxisCount: 4,
+                        crossAxisSpacing: 10,
+                        mainAxisSpacing: 10,
+                        childAspectRatio: 1.1,
                       ),
-                    ),
-                  ),
-                  const SizedBox(height: 16),
-                  Card(
-                    child: Padding(
-                      padding: const EdgeInsets.all(16),
-                      child: Column(
-                        children: [
-                          Container(
-                            height: 76,
-                            alignment: Alignment.centerRight,
-                            padding: const EdgeInsets.symmetric(horizontal: 18),
-                            decoration: BoxDecoration(
-                              color: const Color(0xfff2eee8),
-                              borderRadius: BorderRadius.circular(8),
+                      itemCount: categories.length,
+                      itemBuilder: (_, i) {
+                        final category = categories[i];
+                        final selected =
+                            selectedCategory?['id'] == category['id'];
+                        final colors = [
+                          const Color(0xffe67e22),
+                          const Color(0xffc0392b),
+                          const Color(0xff8e44ad),
+                          const Color(0xff27ae60),
+                          accent,
+                          const Color(0xff2874a6),
+                        ];
+                        return Card(
+                          color: selected
+                              ? const Color(0xfffff7df)
+                              : Colors.white,
+                          child: InkWell(
+                            onTap: () => setState(
+                              () => selectedCategory = category,
                             ),
-                            child: Text(
-                              money(amount),
-                              style: const TextStyle(
-                                fontSize: 32,
-                                fontWeight: FontWeight.w900,
-                              ),
-                            ),
-                          ),
-                          const SizedBox(height: 12),
-                          for (final row in const [
-                            ['7', '8', '9'],
-                            ['4', '5', '6'],
-                            ['1', '2', '3'],
-                          ])
-                            Padding(
-                              padding: const EdgeInsets.only(bottom: 8),
-                              child: Row(
-                                children: [
-                                  for (final digit in row)
-                                    Expanded(
-                                      child: Padding(
-                                        padding: const EdgeInsets.symmetric(
-                                          horizontal: 4,
-                                        ),
-                                        child: OutlinedButton(
-                                          onPressed: () => pressDigit(digit),
-                                          child: Text(
-                                            digit,
-                                            style: const TextStyle(
-                                              fontSize: 22,
-                                              fontWeight: FontWeight.w900,
-                                            ),
-                                          ),
-                                        ),
-                                      ),
-                                    ),
-                                ],
-                              ),
-                            ),
-                          Row(
-                            children: [
-                              Expanded(
-                                flex: 2,
-                                child: Padding(
-                                  padding: const EdgeInsets.symmetric(
-                                    horizontal: 4,
-                                  ),
-                                  child: OutlinedButton(
-                                    onPressed: () => pressDigit('0'),
-                                    child: const Text(
-                                      '0',
-                                      style: TextStyle(
-                                        fontSize: 22,
-                                        fontWeight: FontWeight.w900,
-                                      ),
-                                    ),
+                            child: Column(
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              children: [
+                                CircleAvatar(
+                                  backgroundColor: colors[i % colors.length],
+                                  radius: 18,
+                                ),
+                                const SizedBox(height: 8),
+                                Text(
+                                  '${category['name']}',
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: const TextStyle(
+                                    fontWeight: FontWeight.w800,
                                   ),
                                 ),
-                              ),
-                              Expanded(
-                                child: Padding(
-                                  padding: const EdgeInsets.symmetric(
-                                    horizontal: 4,
-                                  ),
-                                  child: OutlinedButton.icon(
-                                    onPressed: backspace,
-                                    icon: const Icon(Icons.backspace_outlined),
-                                    label: const Text(''),
-                                    style: OutlinedButton.styleFrom(
-                                      foregroundColor: Colors.red,
-                                      backgroundColor: const Color(0xffffeeee),
-                                    ),
+                                const SizedBox(height: 4),
+                                Text(
+                                  money(category['inventory_value']),
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: const TextStyle(
+                                    fontSize: 11,
+                                    color: Color(0xff7a6a52),
                                   ),
                                 ),
-                              ),
-                            ],
-                          ),
-                          const SizedBox(height: 8),
-                          FilledButton(
-                            onPressed: addCategoryAmount,
-                            style: FilledButton.styleFrom(
-                              backgroundColor: accent,
-                              foregroundColor: Colors.white,
-                              minimumSize: const Size.fromHeight(62),
-                            ),
-                            child: Text(
-                              tx('اضغط  X', 'PRESS  X'),
-                              style: TextStyle(
-                                fontSize: 24,
-                                fontWeight: FontWeight.w900,
-                              ),
+                              ],
                             ),
                           ),
-                          const SizedBox(height: 10),
-                          Text(
-                            tx(
-                              'الرقم × 1,000 د.ع. مثال: اضغط 5 ثم X = 5,000 د.ع.',
-                              'Number x 1,000 IQD. Example: press 5 then X = 5,000 IQD.',
-                            ),
-                            style: TextStyle(color: Colors.brown.shade500),
-                          ),
-                          if (message.isNotEmpty)
-                            Padding(
-                              padding: const EdgeInsets.only(top: 8),
-                              child: Text(
-                                message,
-                                style: const TextStyle(color: Colors.red),
-                              ),
-                            ),
-                        ],
-                      ),
+                        );
+                      },
                     ),
                   ),
                 ],
@@ -5000,6 +5430,954 @@ class FinanceMetric extends StatelessWidget {
     );
   }
 }
+
+// ═══════════════════════════════════════════════════════════════════════════
+// REPORTS PAGE
+// ═══════════════════════════════════════════════════════════════════════════
+
+class ReportsPage extends StatefulWidget {
+  const ReportsPage({super.key, required this.store, required this.user});
+  final PosStore store;
+  final UserSession user;
+
+  @override
+  State<ReportsPage> createState() => _ReportsPageState();
+}
+
+class _ReportsPageState extends State<ReportsPage> {
+  DateTime _from = DateTime(DateTime.now().year, 1, 1);
+  DateTime _to = DateTime.now();
+  String _periodGroup = 'daily';
+  String _catGroup = 'daily';
+  bool _loading = false;
+  bool _printing = false;
+
+  Map<String, Object?> _summary = {};
+  List<Map<String, Object?>> _periods = [];
+  List<Map<String, Object?>> _products = [];
+  List<Map<String, Object?>> _catSales = [];
+  List<Map<String, Object?>> _expenses = [];
+  List<Map<String, Object?>> _expensesByType = [];
+
+  String get _fromStr => DateFormat('yyyy-MM-dd').format(_from);
+  String get _toStr => DateFormat('yyyy-MM-dd').format(_to);
+
+  @override
+  void initState() {
+    super.initState();
+    _load();
+  }
+
+  Future<void> _load() async {
+    setState(() => _loading = true);
+    final results = await Future.wait([
+      widget.store.reportSummary(_fromStr, _toStr),
+      widget.store.reportPeriods(_fromStr, _toStr, _periodGroup),
+      widget.store.reportTopProducts(_fromStr, _toStr),
+      widget.store.reportCategorySales(_fromStr, _toStr, _catGroup),
+      widget.store.reportExpenses(_fromStr, _toStr),
+      widget.store.reportExpensesByType(_fromStr, _toStr),
+    ]);
+    if (!mounted) return;
+    setState(() {
+      _summary = results[0] as Map<String, Object?>;
+      _periods = results[1] as List<Map<String, Object?>>;
+      _products = results[2] as List<Map<String, Object?>>;
+      _catSales = results[3] as List<Map<String, Object?>>;
+      _expenses = results[4] as List<Map<String, Object?>>;
+      _expensesByType = results[5] as List<Map<String, Object?>>;
+      _loading = false;
+    });
+  }
+
+  Future<void> _loadCatSales() async {
+    final rows = await widget.store.reportCategorySales(
+      _fromStr,
+      _toStr,
+      _catGroup,
+    );
+    if (!mounted) return;
+    setState(() => _catSales = rows);
+  }
+
+  Future<void> _print() async {
+    // Show section-selection dialog
+    bool selSummary = true, selPeriods = true, selProducts = true,
+        selCatSales = true, selExpenses = true, selProfitLoss = true;
+
+    final confirmed = await showDialog<bool>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setDlg) {
+          Widget tile(String label, bool val, void Function(bool) onChanged) =>
+              CheckboxListTile(
+                dense: true,
+                title: Text(label),
+                value: val,
+                onChanged: (v) => setDlg(() => onChanged(v ?? val)),
+                controlAffinity: ListTileControlAffinity.leading,
+              );
+          return AlertDialog(
+            title: Text(tx('اختر ما تريد طباعته', 'Choose what to print')),
+            content: SizedBox(
+              width: 320,
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  tile(tx('الملخص', 'Summary'), selSummary, (v) => selSummary = v),
+                  tile(tx('بيانات التقرير (الفترات)', 'Report Data (Periods)'), selPeriods, (v) => selPeriods = v),
+                  tile(tx('المنتجات التفصيلية', 'Detailed Products'), selProducts, (v) => selProducts = v),
+                  tile(tx('مبيعات الفئات', 'Category Sales'), selCatSales, (v) => selCatSales = v),
+                  tile(tx('المصاريف', 'Expenses'), selExpenses, (v) => selExpenses = v),
+                  tile(tx('الأرباح والخسائر', 'Profit & Loss'), selProfitLoss, (v) => selProfitLoss = v),
+                ],
+              ),
+            ),
+            actions: [
+              TextButton(onPressed: () => Navigator.pop(ctx, false), child: Text(tx('إلغاء', 'Cancel'))),
+              FilledButton.icon(
+                onPressed: () => Navigator.pop(ctx, true),
+                icon: const Icon(Icons.print),
+                label: Text(tx('طباعة', 'Print')),
+              ),
+            ],
+          );
+        },
+      ),
+    );
+
+    if (confirmed != true) return;
+    setState(() => _printing = true);
+    try {
+      await widget.store.printReport(
+        from: _fromStr,
+        to: _toStr,
+        summary: _summary,
+        periods: _periods,
+        products: _products,
+        catSales: _catSales,
+        expenses: _expenses,
+        expensesByType: _expensesByType,
+        printSummary: selSummary,
+        printPeriods: selPeriods,
+        printProducts: selProducts,
+        printCatSales: selCatSales,
+        printExpenses: selExpenses,
+        printProfitLoss: selProfitLoss,
+      );
+    } finally {
+      if (mounted) setState(() => _printing = false);
+    }
+  }
+
+  void _quickRange(String range) {
+    final now = DateTime.now();
+    setState(() {
+      switch (range) {
+        case 'today':
+          _from = DateTime(now.year, now.month, now.day);
+          _to = now;
+        case 'week':
+          _from = now.subtract(const Duration(days: 6));
+          _to = now;
+        case 'month':
+          _from = DateTime(now.year, now.month, 1);
+          _to = now;
+        case 'last_month':
+          final first = DateTime(now.year, now.month - 1, 1);
+          _from = first;
+          _to = DateTime(now.year, now.month, 0);
+        case 'year':
+          _from = DateTime(now.year, 1, 1);
+          _to = now;
+      }
+    });
+    _load();
+  }
+
+  Future<void> _pickDate(bool isFrom) async {
+    final picked = await showDatePicker(
+      context: context,
+      initialDate: isFrom ? _from : _to,
+      firstDate: DateTime(2020),
+      lastDate: DateTime(2100),
+    );
+    if (picked == null) return;
+    setState(() {
+      if (isFrom) {
+        _from = picked;
+      } else {
+        _to = picked;
+      }
+    });
+    _load();
+  }
+
+  Widget _sectionTitle(String title) => Padding(
+    padding: const EdgeInsets.only(bottom: 12),
+    child: Text(
+      title,
+      style: const TextStyle(fontSize: 18, fontWeight: FontWeight.w800),
+    ),
+  );
+
+  Widget _summaryCard(String label, String value, Color bg) => Expanded(
+    child: Container(
+      padding: const EdgeInsets.symmetric(horizontal: 20, vertical: 18),
+      decoration: BoxDecoration(
+        color: bg,
+        borderRadius: BorderRadius.circular(10),
+        border: Border.all(color: Colors.black12),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            label,
+            style: const TextStyle(fontSize: 12, color: Colors.black54),
+          ),
+          const SizedBox(height: 6),
+          Text(
+            value,
+            style: const TextStyle(fontSize: 22, fontWeight: FontWeight.w900),
+          ),
+        ],
+      ),
+    ),
+  );
+
+  Widget _th(String text, {TextAlign align = TextAlign.start}) => TableCell(
+    child: Padding(
+      padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 6),
+      child: Text(
+        text,
+        textAlign: align,
+        style: const TextStyle(
+          fontSize: 11,
+          fontWeight: FontWeight.w700,
+          color: Colors.black54,
+          letterSpacing: 0.5,
+        ),
+      ),
+    ),
+  );
+
+  Widget _td(String text, {TextAlign align = TextAlign.start, Color? color, FontWeight? weight}) => TableCell(
+    child: Padding(
+      padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 6),
+      child: Text(
+        text,
+        textAlign: align,
+        style: TextStyle(
+          color: color,
+          fontWeight: weight ?? FontWeight.normal,
+          fontSize: 13,
+        ),
+      ),
+    ),
+  );
+
+  @override
+  Widget build(BuildContext context) {
+    final accent = brandGold;
+    final invoices = (_summary['invoices'] as num?)?.toInt() ?? 0;
+    final totalSales = (_summary['total_sales'] as num?)?.toDouble() ?? 0;
+    final avgTicket = (_summary['avg_ticket'] as num?)?.toDouble() ?? 0;
+    final totalExpenses = (_summary['total_expenses'] as num?)?.toDouble() ?? 0;
+    final productSales = (_summary['product_sales'] as num?)?.toDouble() ?? 0;
+    final netProfit = totalSales - totalExpenses;
+
+    // Category POS totals
+    double catGross = 0;
+    double catDiscount = 0;
+    double catNet = 0;
+    for (final r in _catSales) {
+      catGross += (r['before_discount'] as num?)?.toDouble() ?? 0;
+      catDiscount += (r['discount'] as num?)?.toDouble() ?? 0;
+      catNet += (r['after_discount'] as num?)?.toDouble() ?? 0;
+    }
+
+    // Expense totals
+    double expenseTotal = 0;
+    for (final r in _expenses) {
+      expenseTotal += (r['amount'] as num?)?.toDouble() ?? 0;
+    }
+    final maxExpType = _expensesByType.isEmpty
+        ? 0.0
+        : (_expensesByType.first['total'] as num?)?.toDouble() ?? 0;
+
+    return _loading && _summary.isEmpty
+        ? const Center(child: CircularProgressIndicator())
+        : SingleChildScrollView(
+            padding: const EdgeInsets.all(24),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                // ── Filter bar ──────────────────────────────────────────
+                Card(
+                  child: Padding(
+                    padding: const EdgeInsets.all(20),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Wrap(
+                          spacing: 8,
+                          runSpacing: 8,
+                          children: [
+                            _QuickBtn(
+                              label: tx('اليوم', 'Today'),
+                              onTap: () => _quickRange('today'),
+                            ),
+                            _QuickBtn(
+                              label: tx('هذا الأسبوع', 'This Week'),
+                              onTap: () => _quickRange('week'),
+                            ),
+                            _QuickBtn(
+                              label: tx('هذا الشهر', 'This Month'),
+                              onTap: () => _quickRange('month'),
+                            ),
+                            _QuickBtn(
+                              label: tx('الشهر الماضي', 'Last Month'),
+                              onTap: () => _quickRange('last_month'),
+                            ),
+                            _QuickBtn(
+                              label: tx('هذه السنة', 'This Year'),
+                              onTap: () => _quickRange('year'),
+                              active: true,
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 16),
+                        Row(
+                          children: [
+                            Text(tx('تجميع:', 'Group by:')),
+                            const SizedBox(width: 10),
+                            DropdownButton<String>(
+                              value: _periodGroup,
+                              items: [
+                                DropdownMenuItem(value: 'daily', child: Text(tx('يومي', 'Daily'))),
+                                DropdownMenuItem(value: 'monthly', child: Text(tx('شهري', 'Monthly'))),
+                                DropdownMenuItem(value: 'yearly', child: Text(tx('سنوي', 'Yearly'))),
+                              ],
+                              onChanged: (v) {
+                                if (v == null) return;
+                                setState(() => _periodGroup = v);
+                                _load();
+                              },
+                            ),
+                            const SizedBox(width: 24),
+                            Text(tx('من:', 'From:')),
+                            const SizedBox(width: 8),
+                            OutlinedButton(
+                              onPressed: () => _pickDate(true),
+                              child: Text(DateFormat('yyyy-MM-dd').format(_from)),
+                            ),
+                            const SizedBox(width: 16),
+                            Text(tx('إلى:', 'To:')),
+                            const SizedBox(width: 8),
+                            OutlinedButton(
+                              onPressed: () => _pickDate(false),
+                              child: Text(DateFormat('yyyy-MM-dd').format(_to)),
+                            ),
+                            const SizedBox(width: 16),
+                            FilledButton(
+                              onPressed: _load,
+                              child: Text(tx('تصفية', 'Filter')),
+                            ),
+                            const SizedBox(width: 8),
+                            OutlinedButton.icon(
+                              onPressed: _printing ? null : _print,
+                              icon: _printing
+                                  ? const SizedBox(width: 16, height: 16, child: CircularProgressIndicator(strokeWidth: 2))
+                                  : const Icon(Icons.print),
+                              label: Text(tx('طباعة', 'Print')),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 8),
+                        Text(
+                          '${tx('الفترة الحالية:', 'Current period:')} $_fromStr ${tx('إلى', 'to')} $_toStr',
+                          style: const TextStyle(color: Colors.black54, fontSize: 13),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 20),
+
+                // ── Summary cards ───────────────────────────────────────
+                Row(
+                  children: [
+                    _summaryCard(
+                      tx('إجمالي المبيعات', 'TOTAL SALES'),
+                      money(totalSales),
+                      const Color(0xfff5f0e8),
+                    ),
+                    const SizedBox(width: 12),
+                    _summaryCard(
+                      tx('الفواتير', 'INVOICES'),
+                      '$invoices',
+                      const Color(0xffe8f5f0),
+                    ),
+                    const SizedBox(width: 12),
+                    _summaryCard(
+                      tx('متوسط الفاتورة', 'AVG TICKET'),
+                      money(avgTicket),
+                      const Color(0xffe8eef5),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 24),
+
+                // ── Report Data table ───────────────────────────────────
+                Card(
+                  child: Padding(
+                    padding: const EdgeInsets.all(20),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        _sectionTitle(tx('بيانات التقرير', 'Report Data')),
+                        if (_periods.isEmpty)
+                          Center(child: Padding(
+                            padding: const EdgeInsets.all(20),
+                            child: Text(tx('لا توجد نتائج', 'No results found'),
+                              style: const TextStyle(color: Colors.black45)),
+                          ))
+                        else
+                          Table(
+                            columnWidths: const {
+                              0: FlexColumnWidth(2),
+                              1: FlexColumnWidth(1),
+                              2: FlexColumnWidth(2),
+                              3: FlexColumnWidth(2),
+                            },
+                            border: TableBorder(
+                              horizontalInside: BorderSide(color: Colors.grey.shade200),
+                            ),
+                            children: [
+                              TableRow(
+                                decoration: BoxDecoration(color: Colors.grey.shade50),
+                                children: [
+                                  _th(tx('الفترة', 'PERIOD')),
+                                  _th(tx('الفواتير', 'INVOICES')),
+                                  _th(tx('إجمالي المبيعات', 'TOTAL SALES')),
+                                  _th(tx('متوسط الفاتورة', 'AVG TICKET')),
+                                ],
+                              ),
+                              for (final row in _periods)
+                                TableRow(children: [
+                                  _td('${row['period']}'),
+                                  _td('${row['invoices']}'),
+                                  _td(money(row['total_sales']), color: accent, weight: FontWeight.w700),
+                                  _td(money(row['avg_ticket'])),
+                                ]),
+                            ],
+                          ),
+                      ],
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 20),
+
+                // ── Detailed Sold Report ────────────────────────────────
+                Card(
+                  child: Padding(
+                    padding: const EdgeInsets.all(20),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        _sectionTitle(
+                          '${tx('تقرير المبيعات التفصيلي', 'Detailed Sold Report')} ($_fromStr → $_toStr)',
+                        ),
+                        if (_products.isEmpty)
+                          Center(child: Padding(
+                            padding: const EdgeInsets.all(20),
+                            child: Text(tx('لا توجد نتائج', 'No results found'),
+                              style: const TextStyle(color: Colors.black45)),
+                          ))
+                        else
+                          Table(
+                            columnWidths: const {
+                              0: FixedColumnWidth(36),
+                              1: FlexColumnWidth(3),
+                              2: FlexColumnWidth(1.5),
+                              3: FlexColumnWidth(2),
+                              4: FlexColumnWidth(2),
+                              5: FlexColumnWidth(2),
+                              6: FlexColumnWidth(2),
+                            },
+                            border: TableBorder(
+                              horizontalInside: BorderSide(color: Colors.grey.shade200),
+                            ),
+                            children: [
+                              TableRow(
+                                decoration: BoxDecoration(color: Colors.grey.shade50),
+                                children: [
+                                  _th('#'),
+                                  _th(tx('المنتج', 'PRODUCT')),
+                                  _th(tx('الكمية', 'QTY SOLD')),
+                                  _th(tx('سعر الشراء', 'UNIT COST')),
+                                  _th(tx('متوسط سعر البيع', 'AVG SELL PRICE')),
+                                  _th(tx('الخصم', 'DISCOUNT')),
+                                  _th(tx('الإجمالي', 'FINAL TOTAL')),
+                                ],
+                              ),
+                              for (var i = 0; i < _products.length; i++)
+                                TableRow(children: [
+                                  _td('${i + 1}'),
+                                  _td('${_products[i]['name']}'),
+                                  _td('${_products[i]['qty_sold']}'),
+                                  _td(money(_products[i]['unit_cost'])),
+                                  _td(money(_products[i]['avg_sell_price'])),
+                                  _td(_products[i]['discount'] != null && (_products[i]['discount'] as num) > 0
+                                      ? '- ${money(_products[i]['discount'])}'
+                                      : '—'),
+                                  _td(money(_products[i]['final_total']), color: accent, weight: FontWeight.w700),
+                                ]),
+                            ],
+                          ),
+                      ],
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 20),
+
+                // ── Category POS Sales ──────────────────────────────────
+                Card(
+                  child: Padding(
+                    padding: const EdgeInsets.all(20),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        Row(
+                          children: [
+                            Expanded(
+                              child: _sectionTitle(
+                                '${tx('مبيعات الفئات', 'Category POS Sales')} ($_fromStr → $_toStr)',
+                              ),
+                            ),
+                            SegmentedButton<String>(
+                              segments: [
+                                ButtonSegment(value: 'daily', label: Text(tx('يومي', 'Daily'))),
+                                ButtonSegment(value: 'monthly', label: Text(tx('شهري', 'Monthly'))),
+                                ButtonSegment(value: 'yearly', label: Text(tx('سنوي', 'Yearly'))),
+                              ],
+                              selected: {_catGroup},
+                              onSelectionChanged: (v) {
+                                setState(() => _catGroup = v.first);
+                                _loadCatSales();
+                              },
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 16),
+                        Row(
+                          children: [
+                            _summaryCard(tx('الإجمالي قبل الخصم', 'GROSS TOTAL'),
+                              money(catGross), const Color(0xfff5f0e8)),
+                            const SizedBox(width: 12),
+                            _summaryCard(tx('إجمالي الخصومات', 'TOTAL DISCOUNTS'),
+                              catDiscount > 0 ? '- ${money(catDiscount)}' : money(catDiscount),
+                              const Color(0xfffff0f0)),
+                            const SizedBox(width: 12),
+                            _summaryCard(tx('الصافي', 'NET TOTAL'),
+                              money(catNet), const Color(0xfffff7df)),
+                          ],
+                        ),
+                        const SizedBox(height: 16),
+                        if (_catSales.isEmpty)
+                          Center(child: Padding(
+                            padding: const EdgeInsets.all(20),
+                            child: Text(tx('لا توجد نتائج', 'No results found'),
+                              style: const TextStyle(color: Colors.black45)),
+                          ))
+                        else
+                          Table(
+                            columnWidths: const {
+                              0: FixedColumnWidth(36),
+                              1: FlexColumnWidth(2),
+                              2: FlexColumnWidth(1.2),
+                              3: FlexColumnWidth(2),
+                              4: FlexColumnWidth(1.5),
+                              5: FlexColumnWidth(2),
+                              6: FlexColumnWidth(1.2),
+                            },
+                            border: TableBorder(
+                              horizontalInside: BorderSide(color: Colors.grey.shade200),
+                            ),
+                            children: [
+                              TableRow(
+                                decoration: BoxDecoration(color: Colors.grey.shade50),
+                                children: [
+                                  _th('#'),
+                                  _th(tx('الفئة', 'CATEGORY')),
+                                  _th(tx('الفواتير', 'INVOICES')),
+                                  _th(tx('قبل الخصم', 'BEFORE DISCOUNT')),
+                                  _th(tx('الخصم', 'DISCOUNT')),
+                                  _th(tx('بعد الخصم', 'AFTER DISCOUNT')),
+                                  _th(tx('النسبة', 'SHARE')),
+                                ],
+                              ),
+                              for (var i = 0; i < _catSales.length; i++)
+                                () {
+                                  final r = _catSales[i];
+                                  final afterDisc = (r['after_discount'] as num?)?.toDouble() ?? 0;
+                                  final share = catNet > 0 ? afterDisc / catNet * 100 : 0.0;
+                                  final disc = (r['discount'] as num?)?.toDouble() ?? 0;
+                                  return TableRow(children: [
+                                    _td('${i + 1}'),
+                                    _td('${r['name']}', weight: FontWeight.w600),
+                                    _td('${r['invoices']}'),
+                                    _td(money(r['before_discount'])),
+                                    _td(disc > 0 ? '- ${money(disc)}' : '—', color: disc > 0 ? Colors.red : null),
+                                    _td(money(r['after_discount']), color: accent, weight: FontWeight.w700),
+                                    TableCell(
+                                      child: Padding(
+                                        padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 6),
+                                        child: Row(
+                                          children: [
+                                            Expanded(
+                                              child: ClipRRect(
+                                                borderRadius: BorderRadius.circular(4),
+                                                child: LinearProgressIndicator(
+                                                  value: share / 100,
+                                                  minHeight: 8,
+                                                  backgroundColor: Colors.grey.shade200,
+                                                  color: accent,
+                                                ),
+                                              ),
+                                            ),
+                                            const SizedBox(width: 6),
+                                            Text('${share.toStringAsFixed(1)}%',
+                                              style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w600)),
+                                          ],
+                                        ),
+                                      ),
+                                    ),
+                                  ]);
+                                }(),
+                              TableRow(
+                                decoration: BoxDecoration(color: Colors.grey.shade50),
+                                children: [
+                                  _td(''),
+                                  _td(tx('المجموع الكلي', 'Grand Total'), weight: FontWeight.w800),
+                                  _td('${_catSales.fold<int>(0, (s, r) => s + ((r['invoices'] as num?)?.toInt() ?? 0))}', weight: FontWeight.w700),
+                                  _td(money(catGross)),
+                                  _td(catDiscount > 0 ? '- ${money(catDiscount)}' : '—', color: Colors.red),
+                                  _td(money(catNet), color: accent, weight: FontWeight.w800),
+                                  _td('100%', weight: FontWeight.w700),
+                                ],
+                              ),
+                            ],
+                          ),
+                      ],
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 20),
+
+                // ── Expenses ────────────────────────────────────────────
+                Card(
+                  child: Padding(
+                    padding: const EdgeInsets.all(20),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        Row(
+                          children: [
+                            Expanded(
+                              child: _sectionTitle(
+                                '${tx('المصاريف', 'Expenses')} ($_fromStr → $_toStr)',
+                              ),
+                            ),
+                            OutlinedButton.icon(
+                              onPressed: () => _showAddExpense(context),
+                              icon: const Icon(Icons.add),
+                              label: Text(tx('إضافة مصروف', 'Add Expense')),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 12),
+                        Row(
+                          children: [
+                            _summaryCard(tx('إجمالي المصاريف', 'TOTAL EXPENSES'),
+                              expenseTotal > 0 ? '- ${money(expenseTotal)}' : money(expenseTotal),
+                              const Color(0xfffff0f0)),
+                            const SizedBox(width: 12),
+                            _summaryCard(tx('عدد القيود', 'NO. OF ENTRIES'),
+                              '${_expenses.length}\n${tx('قيود', 'entries')}',
+                              const Color(0xfff5f5f5)),
+                            const SizedBox(width: 12),
+                            _summaryCard(tx('صافي الربح (بعد المصاريف)', 'NET PROFIT (AFTER EXPENSES)'),
+                              money(netProfit), const Color(0xfffff7df)),
+                          ],
+                        ),
+                        if (_expensesByType.isNotEmpty) ...[
+                          const SizedBox(height: 16),
+                          Container(
+                            padding: const EdgeInsets.all(12),
+                            decoration: BoxDecoration(
+                              color: Colors.grey.shade50,
+                              borderRadius: BorderRadius.circular(8),
+                              border: Border.all(color: Colors.grey.shade200),
+                            ),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(tx('المصاريف حسب النوع', 'EXPENSES BY CATEGORY'),
+                                  style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w700,
+                                    color: Colors.black54, letterSpacing: 0.5)),
+                                const SizedBox(height: 10),
+                                for (final r in _expensesByType)
+                                  Padding(
+                                    padding: const EdgeInsets.only(bottom: 8),
+                                    child: Row(
+                                      children: [
+                                        SizedBox(
+                                          width: 100,
+                                          child: Text('${r['name']}',
+                                            style: const TextStyle(fontWeight: FontWeight.w600)),
+                                        ),
+                                        const SizedBox(width: 10),
+                                        Expanded(
+                                          child: ClipRRect(
+                                            borderRadius: BorderRadius.circular(4),
+                                            child: LinearProgressIndicator(
+                                              value: maxExpType > 0
+                                                ? ((r['total'] as num?)?.toDouble() ?? 0) / maxExpType
+                                                : 0,
+                                              minHeight: 10,
+                                              backgroundColor: Colors.grey.shade200,
+                                              color: Colors.redAccent,
+                                            ),
+                                          ),
+                                        ),
+                                        const SizedBox(width: 10),
+                                        Text(money(r['total']),
+                                          style: const TextStyle(fontWeight: FontWeight.w600, color: Colors.red)),
+                                        const SizedBox(width: 6),
+                                        Text(maxExpType > 0
+                                          ? '${(((r['total'] as num?)?.toDouble() ?? 0) / expenseTotal * 100).toStringAsFixed(0)}%'
+                                          : '0%',
+                                          style: const TextStyle(fontSize: 12, color: Colors.black54)),
+                                      ],
+                                    ),
+                                  ),
+                              ],
+                            ),
+                          ),
+                        ],
+                        const SizedBox(height: 16),
+                        if (_expenses.isEmpty)
+                          Center(child: Padding(
+                            padding: const EdgeInsets.all(20),
+                            child: Text(tx('لا توجد نتائج', 'No results found'),
+                              style: const TextStyle(color: Colors.black45)),
+                          ))
+                        else
+                          Table(
+                            columnWidths: const {
+                              0: FixedColumnWidth(36),
+                              1: FlexColumnWidth(1.5),
+                              2: FlexColumnWidth(1.5),
+                              3: FlexColumnWidth(3),
+                              4: FlexColumnWidth(2),
+                              5: FlexColumnWidth(1.5),
+                            },
+                            border: TableBorder(
+                              horizontalInside: BorderSide(color: Colors.grey.shade200),
+                            ),
+                            children: [
+                              TableRow(
+                                decoration: BoxDecoration(color: Colors.grey.shade50),
+                                children: [
+                                  _th('#'),
+                                  _th(tx('التاريخ', 'DATE')),
+                                  _th(tx('النوع', 'CATEGORY')),
+                                  _th(tx('الوصف', 'DESCRIPTION / WHAT WAS SPENT ON')),
+                                  _th(tx('أضيف بواسطة', 'ADDED BY')),
+                                  _th(tx('المبلغ', 'AMOUNT')),
+                                ],
+                              ),
+                              for (var i = 0; i < _expenses.length; i++)
+                                TableRow(children: [
+                                  _td('${i + 1}'),
+                                  _td(DateFormat('dd/MM/yyyy').format(
+                                    DateTime.parse('${_expenses[i]['created_at']}'))),
+                                  TableCell(
+                                    child: Padding(
+                                      padding: const EdgeInsets.symmetric(vertical: 8, horizontal: 6),
+                                      child: Container(
+                                        padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                                        decoration: BoxDecoration(
+                                          color: Colors.red.shade50,
+                                          borderRadius: BorderRadius.circular(4),
+                                        ),
+                                        child: Text('${_expenses[i]['type']}',
+                                          style: TextStyle(color: Colors.red.shade700,
+                                            fontWeight: FontWeight.w600, fontSize: 12)),
+                                      ),
+                                    ),
+                                  ),
+                                  _td(_expenses[i]['note'] == null || '${_expenses[i]['note']}'.isEmpty
+                                      ? tx('بدون وصف', 'No description')
+                                      : '${_expenses[i]['note']}',
+                                    color: Colors.black54),
+                                  _td('${_expenses[i]['user']}'),
+                                  _td('- ${money(_expenses[i]['amount'])}',
+                                    color: Colors.red, weight: FontWeight.w700),
+                                ]),
+                              TableRow(
+                                decoration: BoxDecoration(color: Colors.red.shade50),
+                                children: [
+                                  _td(''),
+                                  _td(''),
+                                  _td(''),
+                                  _td(''),
+                                  _td(tx('إجمالي المصاريف', 'Total Expenses'), weight: FontWeight.w800),
+                                  _td('- ${money(expenseTotal)}',
+                                    color: Colors.red, weight: FontWeight.w800),
+                                ],
+                              ),
+                            ],
+                          ),
+                      ],
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 20),
+
+                // ── Profit & Loss Summary ───────────────────────────────
+                Card(
+                  child: Padding(
+                    padding: const EdgeInsets.all(20),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        _sectionTitle(
+                          '${tx('ملخص الأرباح والخسائر', 'Profit & Loss Summary')} ($_fromStr → $_toStr)',
+                        ),
+                        _ProfitRow(tx('مبيعات الفئات', 'Category POS Sales'), money(catNet), accent),
+                        _ProfitRow(tx('مبيعات المنتجات التفصيلية', 'Detailed Product Sales'), money(productSales), Colors.black87),
+                        _ProfitRow(tx('صافي الإيرادات', 'Net Revenue'), money(totalSales), Colors.black87, bold: true),
+                        const Divider(height: 20),
+                        _ProfitRow(tx('إجمالي المصاريف', 'Total Expenses'),
+                          expenseTotal > 0 ? '- ${money(expenseTotal)}' : money(expenseTotal), Colors.red),
+                        const Divider(height: 20),
+                        _ProfitRow(tx('صافي الربح', 'NET PROFIT'), money(netProfit), accent, bold: true, large: true),
+                      ],
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 40),
+              ],
+            ),
+          );
+  }
+
+  Future<void> _showAddExpense(BuildContext context) async {
+    final types = await widget.store.expenseTypes();
+    if (!context.mounted) return;
+    int? selectedType = types.isEmpty ? null : (types.first['id'] as int);
+    final amountCtrl = TextEditingController();
+    final noteCtrl = TextEditingController();
+    await showDialog<void>(
+      context: context,
+      builder: (ctx) => StatefulBuilder(
+        builder: (ctx, setDlg) => AlertDialog(
+          title: Text(tx('إضافة مصروف', 'Add Expense')),
+          content: SizedBox(
+            width: 360,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                DropdownButtonFormField<int>(
+                  value: selectedType,
+                  decoration: InputDecoration(labelText: tx('النوع', 'Type')),
+                  items: [
+                    for (final t in types)
+                      DropdownMenuItem(value: t['id'] as int, child: Text('${t['name']}')),
+                  ],
+                  onChanged: (v) => setDlg(() => selectedType = v),
+                ),
+                const SizedBox(height: 12),
+                TextField(
+                  controller: amountCtrl,
+                  decoration: InputDecoration(labelText: tx('المبلغ (د.ع)', 'Amount (IQD)')),
+                  keyboardType: TextInputType.number,
+                ),
+                const SizedBox(height: 12),
+                TextField(
+                  controller: noteCtrl,
+                  decoration: InputDecoration(labelText: tx('الوصف', 'Description')),
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(onPressed: () => Navigator.pop(ctx), child: Text(tx('إلغاء', 'Cancel'))),
+            FilledButton(
+              onPressed: () async {
+                final amt = double.tryParse(amountCtrl.text) ?? 0;
+                if (selectedType == null || amt <= 0) return;
+                await widget.store.addExpense(
+                  selectedType!,
+                  amt,
+                  noteCtrl.text,
+                  widget.user.id,
+                );
+                if (ctx.mounted) Navigator.pop(ctx);
+                _load();
+              },
+              child: Text(tx('حفظ', 'Save')),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+class _QuickBtn extends StatelessWidget {
+  const _QuickBtn({required this.label, required this.onTap, this.active = false});
+  final String label;
+  final VoidCallback onTap;
+  final bool active;
+
+  @override
+  Widget build(BuildContext context) {
+    return active
+      ? FilledButton(onPressed: onTap, child: Text(label))
+      : OutlinedButton(onPressed: onTap, child: Text(label));
+  }
+}
+
+class _ProfitRow extends StatelessWidget {
+  const _ProfitRow(this.label, this.value, this.color, {this.bold = false, this.large = false});
+  final String label, value;
+  final Color color;
+  final bool bold, large;
+
+  @override
+  Widget build(BuildContext context) {
+    final style = TextStyle(
+      color: color,
+      fontWeight: bold ? FontWeight.w800 : FontWeight.normal,
+      fontSize: large ? 18 : 14,
+    );
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 6),
+      child: Row(
+        children: [
+          Expanded(child: Text(label, style: style)),
+          Text(value, style: style),
+        ],
+      ),
+    );
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
 
 class SettingsPage extends StatefulWidget {
   const SettingsPage({super.key, required this.store});
